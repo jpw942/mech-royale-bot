@@ -31,6 +31,16 @@ FARM_MAX_D = 150.0
 EXPLORE_T = 120.0
 EXPLORE_CELL = 50.0
 
+# v3: fight smarter
+COMMIT_HPF = 0.45      # commit to a kill below this est hp fraction
+COMMIT_MEMORY = 8.0    # enemies are remembered (and chased) this long
+COMMIT_REBLOCK = 3.0   # after dropping a commitment, don't re-commit to the same id this long
+AMBUSH_EXPO = 115.0    # world.exposure above this (median walkable cell) counts as exposed
+DUCK_COVER_D = 12.0    # laser duck only to cover this close
+LASER_PEEK_S = 1.7     # stay ducked this long after a laser shot
+HEAL_START = 0.85
+HEAL_DONE = 0.90
+
 
 def wrap(a):
     return (a + math.pi) % TAU - math.pi
@@ -83,6 +93,22 @@ class Bot:
         self.seen = set()          # explored EXPLORE_CELL cells
         self.explore_goal = None
         self.explore_until = -1
+        # v3 state
+        self.dmg_dealt = {}        # id -> total damage we've dealt it
+        self.last_hit_on = {}      # id -> last time we hit it
+        self.last_attack_by = {}   # id -> last time it damaged us (it isn't regenerating then)
+        self.commit_id = None
+        self.commit_block = {}     # id -> time we dropped a commitment
+        self.last_kill_t = -99
+        self.last_enemy_seen_t = -99
+        self.laser_fire_t = -99    # last laser shot heard or seen (charging stopped)
+        self.charge_seen_t = -99   # last time a visible enemy was charging a laser
+        self.rear_hit = None       # (t, bearing) of the last hit from behind
+        self.healing = False
+        self.heal_spot = None
+        mcfg = self.cfg.get("mech", {})
+        self.regen_delay = mcfg.get("regen_delay", 5)
+        self.regen_per_s = mcfg.get("regen_per_s", 45)
         self.up_ids = [u["id"] for u in self.cfg.get("upgrades", [])]
         mf.log(f"upgrades in config: {self.up_ids}")
         unknown = [u for u in UPGRADE_PREF if u not in self.up_ids]
@@ -218,24 +244,44 @@ class Bot:
     # ------------------------------------------------------------------ perception
     def perceive(self, obs):
         t = self.t
-        for m in obs["mechs"]:
-            if m["kind"] != "mech" or m["id"] == self.me_id:
-                continue
-            self.enemies[m["id"]] = dict(m, t=t)
-        for k in [k for k, e in self.enemies.items() if t - e["t"] > 8]:
-            del self.enemies[k]
+        # events first, so damage dealt this tick is counted before we store the hp we see now
         for ev in obs["events"]:
             ty = ev.get("type")
             if ty == "damaged" and ev.get("by") is not None:
                 self.last_hit_t = t
                 self.last_dmg_by = ev["by"]
+                self.last_attack_by[ev["by"]] = t
                 if ev.get("weapon") not in ("npc", "zone"):
                     self.last_mech_hit_t = t
+                    if ev.get("rear") and ev.get("bearing") is not None:
+                        self.rear_hit = (t, ev["bearing"])
                 if ev.get("bearing") is not None:
                     self.threats.append((t, ev["bearing"], 3.0))
+            elif ty == "hit":
+                tid = ev.get("target")
+                self.dmg_dealt[tid] = self.dmg_dealt.get(tid, 0) + ev.get("amount", 0)
+                self.last_hit_on[tid] = t
             elif ty == "kill":
-                self.enemies.pop(ev.get("target"), None)
+                tid = ev.get("target")
+                self.enemies.pop(tid, None)
+                self.last_kill_t = t
+                if tid == self.commit_id:
+                    mf.log(f"t{t:.1f} killed committed {tid}")
+                    self.commit_id = None
+        for m in obs["mechs"]:
+            if m["kind"] != "mech" or m["id"] == self.me_id:
+                continue
+            prev = self.enemies.get(m["id"])
+            if m.get("charging"):
+                self.charge_seen_t = t
+            elif prev is not None and prev.get("charging") and t - prev["t"] < 0.5:
+                self.laser_fire_t = t                    # it stopped charging: it fired
+            self.enemies[m["id"]] = dict(m, t=t, dmg_at_seen=self.dmg_dealt.get(m["id"], 0))
+        for k in [k for k, e in self.enemies.items() if t - e["t"] > COMMIT_MEMORY]:
+            del self.enemies[k]
         for s in obs["sounds"]:
+            if s["kind"] == "laser":
+                self.laser_fire_t = max(self.laser_fire_t, t - s.get("age", 0))
             if s["kind"] in ("gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"):
                 w = {"near": 2.0, "mid": 1.0, "far": 0.3}[s["dist"]]
                 self.threats.append((t - s.get("age", 0), s["bearing"], w))
@@ -262,12 +308,16 @@ class Bot:
             c = self.mech_center(m)
             dist = math.dist(c, mz)
             vis = self.w.los(mz, c) or (m["id"] == self.last_dmg_by and self.t - self.last_hit_t < 1.5)
-            hpf = m.get("hp", 1400) / max(1, m.get("max_hp", 1400))
-            s = -dist / 40.0 - m.get("hp", 1400) / 250.0 + (2.5 if vis else -3.0)
+            est = self.est_hp(m["id"])
+            if est is None:
+                est = m.get("hp", 1400)
+            s = -dist / 40.0 - est / 250.0 + (2.5 if vis else -3.0)
             if m["id"] == self.last_dmg_by and self.t - self.last_hit_t < 3:
                 s += 1.5
             if m["id"] == self.target_id:
                 s += 2.5
+            if m["id"] == self.commit_id:
+                s += 5.0
             if s > bs:
                 bs, best = s, (m, vis, dist)
         return best
@@ -445,6 +495,11 @@ class Bot:
 
         hpf = me["hp"] / max(1, me["max_hp"])
         pos2 = (self.pos[0], self.pos[1])
+        visible_mechs = [m for m in obs["mechs"] if m["kind"] == "mech" and m["id"] != self.me_id]
+        if visible_mechs:
+            self.last_enemy_seen_t = t
+        self.update_commit(obs)
+        self.update_heal(hpf)
         target = self.pick_target(obs)
         tb = self.threat_bearing()
         home = self.zone_home(pos2)
@@ -456,8 +511,7 @@ class Bot:
         # incoming mortar shells: sidestep
         dodge = self.mortar_dodge(obs)
 
-        visible_mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
-        hurt = hpf < 0.38 or (hpf < 0.55 and len(visible_mechs) >= 2)
+        hurt = hpf < 0.45 or (hpf < 0.55 and len(visible_mechs) >= 2)
         if target is not None:
             tm = target[0]
             thpf = tm.get("hp", 1400) / max(1, tm.get("max_hp", 1400))
@@ -467,11 +521,22 @@ class Bot:
         else:
             thpf = 1.0
 
-        if not me["in_zone"] or not zone_ok_soon:
+        in_zone_ok = me["in_zone"] and zone_ok_soon
+        duck = self.duck_cover(obs) if in_zone_ok else None
+        commit_step = self.commit_step(obs, target, hpf, home) if in_zone_ok and duck is None else None
+
+        if not in_zone_ok:
             mode = "zone"
             goal = self.pick_spot()
             move = self.go_to(goal)
             boost = (not me["in_zone"]) or not self.safe_at(pos2, t + 5, 4)
+        elif duck is not None:
+            # a laser is charging on us from range: break line of sight, peek after it fires
+            mode = "duck"
+            move = self.go_to(duck)
+            boost = me["energy"] > 20
+        elif commit_step is not None:
+            mode, move, boost = commit_step
         elif hurt and (target is not None or t - self.last_hit_t < 2.5) and self.have_cover(t):
             mode = "hide"
             move = self.go_to(self.cover)
@@ -481,28 +546,7 @@ class Bot:
             move = self.go_to(self.cover)
             boost = me["energy"] > 40
         elif target is not None and (target[1] or target[2] < self.engage_max()):
-            mode = "fight"
-            m, vis, dist = target
-            self.target_id = m["id"]
-            pref = self.pref_range(m, hpf)
-            ax, ay = norm2(m["pos"][0] - self.pos[0], m["pos"][1] - self.pos[1])
-            if t > self.strafe_until:
-                self.strafe_dir = self.rng.choice((-1, 1))
-                self.strafe_until = t + self.rng.uniform(0.5, 1.4)
-            radial = 0.0
-            if dist > pref + 15:
-                radial = 0.8
-            elif dist < pref - 10:
-                radial = -0.8
-            if not vis:
-                # lost sight: close in along a path
-                move = self.go_to((m["pos"][0], m["pos"][1]))
-            else:
-                move = self.steer((ax * radial - ay * self.strafe_dir, ay * radial + ax * self.strafe_dir))
-            # don't strafe out of the zone
-            nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
-            if not self.safe_at(nxt, t + 8, 6):
-                move = self.go_to(home or tuple(self.z["next_center"]))
+            mode, move, boost = self.fight_move(target, hpf, home)
         elif (t - self.last_mech_hit_t < 2.5 or (t - self.last_hit_t < 2.5 and not self.farm_ok(obs, hpf))) \
                 and self.have_cover(t):
             # while farming early, drone hits don't send us running for cover
@@ -524,13 +568,20 @@ class Bot:
         if target is not None:
             m, vis, dist = target
             self.shoot(self.mech_center(m), m["vel"], vis, out)
+        elif self.commit_id in self.enemies:
+            # committed target out of view: aim at its last known spot (mortar can still lob)
+            e = self.enemies[self.commit_id]
+            self.shoot(self.mech_center(e), e["vel"], False, out)
         else:
             self.idle_aim(obs, move, tb, out)
+        # hit from behind with nothing in view: turn the front armor toward it now
+        if target is None and self.rear_hit is not None and t - self.rear_hit[0] < 1.0:
+            out["aim"] = [self.rear_hit[1], 0.0]
 
         self.manage_loot(obs, out)
 
         # quiet walking when nothing is going on
-        if mode in ("roam", "camp") and not boost:
+        if mode in ("roam", "camp", "heal") and not boost:
             sp = self.cfg["sound"]["step_speed"] / max(1, self.stats.get("walk_speed", 11.7))
             move = [move[0] * sp * 0.92, move[1] * sp * 0.92]
 
@@ -542,8 +593,173 @@ class Bot:
         spent = time.perf_counter() - tick_start
         self.plan.step(max(0.0, 0.010 - spent))
         self.mode = mode
-        mf.draw.label(f"{mode} hp{hpf:.2f} e{me['energy']:.0f}")
+        mf.draw.label(f"{mode} hp{hpf:.2f} e{me['energy']:.0f}" + (f" c{self.commit_id}" if self.commit_id is not None else ""))
         return out
+
+    # ------------------------------------------------------------------ v3: fight smarter
+    def est_hp(self, eid):
+        """Last seen hp, minus damage we dealt since, plus regen after regen_delay without combat."""
+        e = self.enemies.get(eid)
+        if e is None:
+            return None
+        mx = e.get("max_hp", 1400)
+        hp = e.get("hp", mx)
+        hp -= self.dmg_dealt.get(eid, 0) - e.get("dmg_at_seen", 0)
+        start = max(e["t"], self.last_hit_on.get(eid, -99) + self.regen_delay,
+                    self.last_attack_by.get(eid, -99) + self.regen_delay)
+        hp += self.regen_per_s * max(0.0, self.t - start)
+        return max(0.0, min(mx, hp))
+
+    def others_near(self, obs, exclude, r=80):
+        n = 0
+        for m in obs["mechs"]:
+            if m["kind"] == "mech" and m["id"] not in (exclude, self.me_id) and d2(m["pos"], self.pos) < r:
+                n += 1
+        return n
+
+    def drop_commit(self, why):
+        if self.commit_id is not None:
+            mf.log(f"t{self.t:.1f} drop commit {self.commit_id}: {why}")
+            self.commit_block[self.commit_id] = self.t
+        self.commit_id = None
+
+    def update_commit(self, obs):
+        t = self.t
+        if self.commit_id is not None and self.commit_id not in self.enemies:
+            self.drop_commit("gone")
+        if self.commit_id is not None:
+            return
+        my_hp = self.me["hp"]
+        best, be = None, 1e18
+        for eid, e in self.enemies.items():
+            if t - self.commit_block.get(eid, -99) < COMMIT_REBLOCK:
+                continue
+            est = self.est_hp(eid)
+            mx = e.get("max_hp", 1400)
+            if est < COMMIT_HPF * mx or (t - self.last_hit_on.get(eid, -99) < 3 and est < my_hp):
+                if est < be:
+                    best, be = eid, est
+        if best is not None and self.others_near(obs, best) < 2:
+            self.commit_id = best
+            mf.log(f"t{t:.1f} commit {best} est_hp {be:.0f}")
+
+    def commit_step(self, obs, target, hpf, home):
+        """(mode, move, boost) while committed to a kill, or None to fall through to normal logic."""
+        cid = self.commit_id
+        if cid is None:
+            return None
+        e = self.enemies.get(cid)
+        if e is None:
+            self.drop_commit("gone")
+            return None
+        est = self.est_hp(cid)
+        if hpf < 0.25 and est > self.me["hp"]:
+            self.drop_commit("losing")
+            return None
+        if self.others_near(obs, cid) >= 2:
+            self.drop_commit("crowd")
+            return None
+        if target is not None and target[0]["id"] == cid and target[1]:
+            mode, move, boost = self.fight_move(target, hpf, home)
+            return "commit", move, boost
+        # out of sight: chase its last known position so it can't sit and regen
+        goal = (e["pos"][0], e["pos"][1])
+        move = self.go_to(goal)
+        nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+        if not self.safe_at(nxt, self.t + 8, 6):
+            self.drop_commit("zone")
+            return None
+        self.target_id = cid
+        return "chase", move, self.me["energy"] > 30
+
+    def fight_move(self, target, hpf, home):
+        t = self.t
+        m, vis, dist = target
+        self.target_id = m["id"]
+        committed = m["id"] == self.commit_id
+        boost = False
+        mode = "fight"
+        pref = self.pref_range(m, hpf)
+        ax, ay = norm2(m["pos"][0] - self.pos[0], m["pos"][1] - self.pos[1])
+        if t > self.strafe_until:
+            self.strafe_dir = self.rng.choice((-1, 1))
+            self.strafe_until = t + self.rng.uniform(0.5, 1.4)
+        radial = 0.0
+        if dist > pref + 15:
+            radial = 0.8
+        elif dist < pref - 10:
+            radial = -0.8
+        if not vis and committed:
+            move = self.go_to((m["pos"][0], m["pos"][1]))
+            boost = self.me["energy"] > 30
+        elif not vis:
+            # healthy enemy out of sight: don't walk into the open, let it come to us
+            mode = "ambush"
+            move = [0.0, 0.0]
+            if self.w.exposure(self.pos[0], self.pos[1]) > AMBUSH_EXPO and self.have_cover(t) \
+                    and d2(self.cover, self.pos) < 25:
+                move = self.go_to(self.cover)
+        else:
+            move = self.steer((ax * radial - ay * self.strafe_dir, ay * radial + ax * self.strafe_dir))
+        # don't strafe out of the zone
+        nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+        if not self.safe_at(nxt, t + 8, 6):
+            move = self.go_to(home or tuple(self.z["next_center"]))
+        return mode, move, boost
+
+    def duck_cover(self, obs):
+        """Cover point to break LOS from a charging laser (> 40 m), or None."""
+        t = self.t
+        cid = self.commit_id
+        if cid is not None:
+            e = self.enemies.get(cid)
+            est = self.est_hp(cid)
+            if e is not None and est is not None and est < 0.25 * e.get("max_hp", 1400):
+                return None                      # about to finish it: don't duck
+        charging = False
+        for m in obs["mechs"]:
+            if m["kind"] == "mech" and m.get("charging") and d2(m["pos"], self.pos) > 40:
+                charging = True
+                break
+        recent_shot = t - self.laser_fire_t < LASER_PEEK_S and t - self.charge_seen_t < 5
+        if not (charging or recent_shot):
+            return None
+        if not self.have_cover(t) or d2(self.cover, self.pos) > DUCK_COVER_D:
+            return None
+        return self.cover
+
+    def update_heal(self, hpf):
+        t = self.t
+        if hpf >= HEAL_DONE:
+            if self.healing:
+                mf.log(f"t{t:.1f} healed")
+            self.healing = False
+            self.heal_spot = None
+        elif not self.healing and (t - self.last_kill_t < 1.0 or (t - self.last_enemy_seen_t >= 3 and hpf < HEAL_START)):
+            self.healing = True
+            self.heal_spot = None
+
+    def heal_goal(self, obs):
+        """Grab nearby cubes, then stand still somewhere low-exposure until hp is back."""
+        t = self.t
+        p = (self.pos[0], self.pos[1])
+        best = None
+        for c in obs["cubes"]:
+            d = d2(c["pos"], p)
+            q = (c["pos"][0], c["pos"][1])
+            if d < 30 and (best is None or d < best[0]) and self.w.walkable(*q) and self.safe_at(q, t + 10, 6):
+                best = (d, q)
+        if best is not None:
+            return "cube", self.go_to(best[1])
+        sp = self.heal_spot
+        if sp is None or not self.safe_at(sp, t + 15, 5):
+            sp = self.cover if self.have_cover(t) else None
+            if sp is None:
+                sp = self.pick_spot()
+            self.heal_spot = sp
+        if d2(sp, p) < 3:
+            return "heal", [0.0, 0.0]
+        return "heal", self.go_to(sp)
 
     def have_cover(self, t):
         if t - self.cover_t > 1.0:
@@ -738,6 +954,8 @@ class Bot:
         """Nothing to fight: loot cubes/weapons, farm drones/crates, capture drops, drift to zone."""
         t = self.t
         p = (self.pos[0], self.pos[1])
+        if self.healing:
+            return self.heal_goal(obs)          # no looting far away, farming or exploring while healing
         rush = self.early_rush()
         cands = []   # (score, n, pos, kind, max_dist, dist, pickup or None, needs_walkable)
         for c in obs["cubes"]:
@@ -830,8 +1048,8 @@ class Bot:
             else:
                 out["aim"] = self.aim_to(ft["c"])
             return
-        # NPC drones and crates for cubes
-        if quiet and hpf > 0.45:
+        # NPC drones and crates for cubes (not while healing: dealing damage would pause our regen)
+        if quiet and hpf > 0.45 and self.cur_mode != "heal":
             best = None
             for m in obs["mechs"]:
                 if m["kind"] == "npc":
