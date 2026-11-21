@@ -9,10 +9,27 @@ from world import World, Planner
 
 TAU = 2 * math.pi
 WEAPON_RANK = {"lightning": 3.0, "laser": 2.5, "mortar": 1.0, "gun": 0.0}
-UPGRADE_PREF = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "lightning_efficiency",
-                "laser_damage", "laser_charge", "gyros", "servos", "lightning_range", "capacitor",
-                "reactor", "gun_mag", "sensors", "lightning_chain", "gun_velocity", "laser_pierce",
-                "jets", "mortar_reload", "mortar_velocity", "mortar_splash"]
+# Upgrade picks: survivability first, then upgrades for the weapons we hold (best weapon first),
+# then general utility, then upgrades for weapons we don't hold.
+SURVIVAL_UPS = ["armor", "plating", "nanites"]
+WEAPON_UPS = {
+    "lightning": ["lightning_efficiency", "lightning_range", "lightning_chain"],
+    "laser": ["laser_damage", "laser_charge", "laser_pierce"],
+    "gun": ["gun_rate", "gun_damage", "gun_mag", "gun_velocity"],
+    "mortar": ["mortar_reload", "mortar_velocity", "mortar_splash"],
+}
+GENERAL_UPS = ["gyros", "servos", "capacitor", "reactor", "sensors", "jets"]
+UPGRADE_PREF = SURVIVAL_UPS + [u for k in ("lightning", "laser", "gun", "mortar") for u in WEAPON_UPS[k]] + GENERAL_UPS
+
+# Early game: practice hunters trickle in one at a time, so the opening is a safe window to gear up.
+RUSH_T = 90.0          # weapon rush until this time (or until slot 1 holds lightning/laser)
+RUSH_BONUS = {"lightning": 200.0, "laser": 170.0, "mortar": 60.0}
+RUSH_MAX_D = 120.0     # rush pickups up to this far
+ROOF_MAX_H = 15.0      # rooftop pickups up to this high (jump + boost)
+FARM_T = 120.0         # actively hunt drones/crates until this time
+FARM_MAX_D = 150.0
+EXPLORE_T = 120.0
+EXPLORE_CELL = 50.0
 
 
 def wrap(a):
@@ -56,6 +73,22 @@ class Bot:
         self.scan_phase = self.rng.random() * TAU
         self.crate_block = {}      # crate id -> time we gave up
         self.target_id = None
+        self.last_mech_hit_t = -99  # last damage from a mech (not NPC drones or the zone)
+        self.loot_block = {}       # pickup id -> time we gave up on it
+        self.loot_chase = (None, 0.0)
+        self.farm_chase = (None, 0.0)
+        self.farm_tgt = None       # set by idle_goal when farming, consumed by idle_aim
+        self.idle_jump = False     # idle_goal wants jump + boost (rooftop pickup)
+        self.cur_mode = "start"
+        self.seen = set()          # explored EXPLORE_CELL cells
+        self.explore_goal = None
+        self.explore_until = -1
+        self.up_ids = [u["id"] for u in self.cfg.get("upgrades", [])]
+        mf.log(f"upgrades in config: {self.up_ids}")
+        unknown = [u for u in UPGRADE_PREF if u not in self.up_ids]
+        unranked = [u for u in self.up_ids if u not in UPGRADE_PREF]
+        if unknown or unranked:
+            mf.log(f"upgrade pref mismatch: not in config {unknown}, not ranked {unranked}")
         mf.log(f"init {time.perf_counter() - t0:.2f}s")
 
     # ------------------------------------------------------------------ helpers
@@ -196,6 +229,8 @@ class Bot:
             if ty == "damaged" and ev.get("by") is not None:
                 self.last_hit_t = t
                 self.last_dmg_by = ev["by"]
+                if ev.get("weapon") not in ("npc", "zone"):
+                    self.last_mech_hit_t = t
                 if ev.get("bearing") is not None:
                     self.threats.append((t, ev["bearing"], 3.0))
             elif ty == "kill":
@@ -393,11 +428,19 @@ class Bot:
         self.z = obs["zone"]
         out = {}
         self.perceive(obs)
+        self.farm_tgt = None
+        self.idle_jump = False
+        cx, cy = int(self.pos[0] // EXPLORE_CELL), int(self.pos[1] // EXPLORE_CELL)
+        if (cx, cy) not in self.seen:
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    self.seen.add((cx + di, cy + dj))
 
         if obs.get("offer"):
             ch = obs["offer"]["choices"]
             ids = [c["id"] for c in ch]
-            best = min(range(len(ids)), key=lambda i: UPGRADE_PREF.index(ids[i]) if ids[i] in UPGRADE_PREF else 99)
+            rank = self.upgrade_rank()
+            best = min(range(len(ids)), key=lambda i: rank.get(ids[i], 999))
             out["pick"] = best
 
         hpf = me["hp"] / max(1, me["max_hp"])
@@ -460,18 +503,24 @@ class Bot:
             nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
             if not self.safe_at(nxt, t + 8, 6):
                 move = self.go_to(home or tuple(self.z["next_center"]))
-        elif t - self.last_hit_t < 2.5 and self.have_cover(t):
+        elif (t - self.last_mech_hit_t < 2.5 or (t - self.last_hit_t < 2.5 and not self.farm_ok(obs, hpf))) \
+                and self.have_cover(t):
+            # while farming early, drone hits don't send us running for cover
             mode = "evade"
             move = self.go_to(self.cover)
             boost = me["energy"] > 40
         else:
             mode, move = self.idle_goal(obs, hpf)
+            if self.idle_jump:
+                out["jump"] = True
+                boost = True
 
         if dodge is not None:
             move = self.steer(dodge)
             boost = me["energy"] > 20
 
         # ----- aim / fire
+        self.cur_mode = mode
         if target is not None:
             m, vis, dist = target
             self.shoot(self.mech_center(m), m["vel"], vis, out)
@@ -545,33 +594,198 @@ class Bot:
                 continue
         return None
 
+    def upgrade_rank(self):
+        """id -> rank (lower is better): survival, held-weapon upgrades, general, the rest."""
+        held = sorted({w["kind"] for w in self.me["weapons"] if w}, key=lambda k: -WEAPON_RANK.get(k, 0))
+        order = list(SURVIVAL_UPS)
+        for k in held:
+            order += WEAPON_UPS.get(k, [])
+        order += GENERAL_UPS
+        for k in ("lightning", "laser", "gun", "mortar"):
+            if k not in held:
+                order += WEAPON_UPS[k]
+        rank = {}
+        for u in order + self.up_ids:
+            rank.setdefault(u, len(rank))
+        return rank
+
+    def early_rush(self):
+        w = self.me["weapons"]
+        w1 = w[1] if len(w) > 1 else None
+        return self.t < RUSH_T and not (w1 and w1["kind"] in ("lightning", "laser"))
+
+    def farm_ok(self, obs, hpf):
+        """Early, healthy, no mech shooting us and no hunter within 90 m."""
+        if self.t >= FARM_T or hpf <= 0.6 or self.t - self.last_mech_hit_t < 4:
+            return False
+        for m in obs["mechs"]:
+            if m["kind"] == "mech" and m["id"] != self.me_id and d2(m["pos"], self.pos) <= 90:
+                return False
+        return True
+
+    def pick_farm(self, obs):
+        """Closest safe NPC drone or crate within FARM_MAX_D, preferring ones we can see."""
+        t = self.t
+        mz = self.muzzle()
+        cands = []
+        for m in obs["mechs"]:
+            if m["kind"] != "npc":
+                continue
+            d = d2(m["pos"], self.pos)
+            if d < FARM_MAX_D and self.safe_at(m["pos"], t + 20, 8):
+                c = (m["pos"][0], m["pos"][1], m["pos"][2] + 1.75)
+                cands.append((d, len(cands), "npc", c, m["vel"], 1.8, m["id"], False))
+        for cr in obs["crates"]:
+            if t - self.crate_block.get(cr["id"], -999) < 60:
+                continue
+            d = d2(cr["pos"], self.pos)
+            if d < FARM_MAX_D and self.safe_at(cr["pos"], t + 20, 8):
+                roof = cr["pos"][2] - self.w.ground(cr["pos"][0], cr["pos"][1]) > 2
+                c = (cr["pos"][0], cr["pos"][1], cr["pos"][2] + 1.2)
+                cands.append((d + 10, len(cands), "crate", c, (0, 0, 0), 1.4, cr["id"], roof))
+        if not cands:
+            return None
+        cands.sort()
+        deadline = time.perf_counter() + 0.004
+        first = None
+        for d, _, kind, c, vel, rad, cid, roof in cands[:6]:
+            vis = time.perf_counter() < deadline and self.w.los(mz, c)
+            tgt = dict(kind=kind, c=c, vel=vel, radius=rad, id=cid, d=math.dist(c, mz), vis=vis)
+            if vis:
+                return tgt
+            if first is None and not roof:      # rooftop crates only when we can already see them
+                first = tgt
+        return first
+
+    def farm_move(self, ft):
+        t = self.t
+        tx, ty = ft["c"][0], ft["c"][1]
+        d = d2((tx, ty), self.pos)
+        if ft["kind"] == "crate":
+            if self.farm_chase[0] != ft["id"]:
+                self.farm_chase = (ft["id"], t)
+            elif t - self.farm_chase[1] > 25:
+                self.crate_block[ft["id"]] = t
+            if d > 30 or not ft["vis"]:
+                return self.go_to((tx, ty))
+            return [0.0, 0.0]
+        # drone: hold 35-50 m and keep strafing so its shots miss
+        if d > 48 or not ft["vis"]:
+            return self.go_to((tx, ty))
+        ax, ay = norm2(tx - self.pos[0], ty - self.pos[1])
+        if t > self.strafe_until:
+            self.strafe_dir = self.rng.choice((-1, 1))
+            self.strafe_until = t + self.rng.uniform(0.6, 1.5)
+        radial = -0.8 if d < 35 else 0.0
+        move = self.steer((ax * radial - ay * self.strafe_dir * 0.7, ay * radial + ax * self.strafe_dir * 0.7))
+        nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+        if not self.safe_at(nxt, t + 10, 6):
+            return [0.0, 0.0]
+        return move
+
+    def loot_move(self, pk):
+        """Walk to a pickup; for rooftop ones, jump + boost the last stretch."""
+        t = self.t
+        if self.loot_chase[0] != pk["id"]:
+            self.loot_chase = (pk["id"], t)
+        elif t - self.loot_chase[1] > 25:
+            self.loot_block[pk["id"]] = t              # can't reach it: give up for a while
+        tx, ty, tz = pk["pos"]
+        hd = d2((tx, ty), self.pos)
+        dz = tz - self.pos[2]
+        on_roof = self.pos[2] - self.w.ground(self.pos[0], self.pos[1]) > 2
+        if dz > 1.0 and hd < 14:
+            me = self.me
+            if me["grounded"] and me["energy"] < 60:
+                return [0.0, 0.0]                      # bank energy for the climb
+            if me["energy"] > 5:
+                self.idle_jump = True
+            ux, uy = norm2(tx - self.pos[0], ty - self.pos[1])
+            return [ux, uy] if hd > 1.0 else [0.0, 0.0]
+        if on_roof and hd < 30:
+            ux, uy = norm2(tx - self.pos[0], ty - self.pos[1])
+            return [ux, uy] if hd > 1.0 else [0.0, 0.0]
+        return self.go_to((tx, ty))
+
+    def explore_target(self):
+        """A not-yet-explored point inside the current zone that stays safe for a while."""
+        t = self.t
+        p = (self.pos[0], self.pos[1])
+        g = self.explore_goal
+        if g is not None and t < self.explore_until and d2(g, p) > 12 and self.safe_at(g, t + 20, 10):
+            return g
+        z = self.z
+        c, r = z["center"], max(z["radius"] - 20, 10)
+        best, bs = None, 1e18
+        for _ in range(24):
+            a = self.rng.random() * TAU
+            rr = math.sqrt(self.rng.random()) * r
+            q = (c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr)
+            if not self.w.walkable(*q) or not self.safe_at(q, t + 30, 12):
+                continue
+            d = d2(q, p)
+            if d < 40:
+                continue
+            seen = (int(q[0] // EXPLORE_CELL), int(q[1] // EXPLORE_CELL)) in self.seen
+            sc = (500 if seen else 0) + abs(d - 90) * 0.5 + 0.2 * self.w.exposure(*q)
+            if sc < bs:
+                bs, best = sc, q
+        self.explore_goal = best
+        self.explore_until = t + 25
+        return best
+
     def idle_goal(self, obs, hpf):
         """Nothing to fight: loot cubes/weapons, farm drones/crates, capture drops, drift to zone."""
         t = self.t
         p = (self.pos[0], self.pos[1])
-        cands = []
+        rush = self.early_rush()
+        cands = []   # (score, n, pos, kind, max_dist, dist, pickup or None, needs_walkable)
         for c in obs["cubes"]:
-            cands.append((d2(c["pos"], p) - 25, (c["pos"][0], c["pos"][1]), "cube"))
+            d = d2(c["pos"], p)
+            sc = d - 1000 if d < 40 else d - 25     # a cube within 40 m beats everything
+            cands.append((sc, len(cands), (c["pos"][0], c["pos"][1]), "cube", 115, d, None, True))
         for pk in obs["pickups"]:
-            if self.want_pickup(pk) and abs(pk["pos"][2] - self.w.ground(*pk["pos"][:2])) < 2:
-                cands.append((d2(pk["pos"], p) - 15, (pk["pos"][0], pk["pos"][1]), "loot"))
+            if not self.want_pickup(pk) or t - self.loot_block.get(pk["id"], -999) < 60:
+                continue
+            q = (pk["pos"][0], pk["pos"][1])
+            d = d2(q, p)
+            height = pk["pos"][2] - self.w.ground(*q)
+            if rush:
+                if height > ROOF_MAX_H:
+                    continue
+                cands.append((d - RUSH_BONUS.get(pk["kind"], 0), len(cands), q, "loot", RUSH_MAX_D, d, pk, height < 2))
+            elif abs(height) < 2:
+                cands.append((d - 15, len(cands), q, "loot", 105, d, pk, True))
         for dr in obs.get("drops", []):
             dd = d2(dr["pos"], p)
             if dd < 180 and dr["lands_in"] < dd / 11 + 4:
                 bonus = 40 if hpf < 0.7 else 0
                 others = dr.get("holder") not in (None, self.me_id)
                 if not others:
-                    cands.append((dd - 30 - bonus, (dr["pos"][0], dr["pos"][1]), "drop"))
+                    cands.append((dd - 30 - bonus, len(cands), (dr["pos"][0], dr["pos"][1]), "drop", 120 + bonus, dd, None, True))
         best = None
         for c in sorted(cands):
-            if c[0] > 90:
-                break
-            if self.safe_at(c[1], t + d2(c[1], p) / 10 + 10, 6) and self.w.walkable(*c[1]):
+            sc, _, q, kind, maxd, d, pk, need_walk = c
+            if d > maxd:
+                continue
+            if self.safe_at(q, t + d / 10 + 10, 6) and (not need_walk or self.w.walkable(*q)):
                 best = c
                 break
         if best:
-            sp = 1.0
-            return best[2], self.go_to(best[1], sp)
+            if best[3] == "loot":
+                return "loot", self.loot_move(best[6])
+            return best[3], self.go_to(best[2], 1.0)
+        # early: go hunting drones and crates for cubes
+        if self.farm_ok(obs, hpf):
+            ft = self.pick_farm(obs)
+            if ft is not None:
+                self.farm_tgt = ft
+                return "farm", self.farm_move(ft)
+        # early with nothing to do: explore the zone instead of sitting at the camp spot
+        if t < EXPLORE_T and hpf > 0.6 and t - self.last_mech_hit_t > 4:
+            g = self.explore_target()
+            if g is not None:
+                return "explore", self.go_to(g)
         spot = self.pick_spot()
         if d2(spot, p) < 3:
             return "camp", [0.0, 0.0]
@@ -608,6 +822,14 @@ class Bot:
         hpf = self.me["hp"] / max(1, self.me["max_hp"])
         mz = self.muzzle()
         quiet = t - self.last_hit_t > 4
+        # early farming target chosen by idle_goal: keep shooting even while the drone shoots back
+        ft = self.farm_tgt
+        if ft is not None:
+            if ft["vis"]:
+                self.shoot(ft["c"], ft["vel"], True, out, is_mech=False, radius=ft["radius"])
+            else:
+                out["aim"] = self.aim_to(ft["c"])
+            return
         # NPC drones and crates for cubes
         if quiet and hpf > 0.45:
             best = None
@@ -649,7 +871,10 @@ class Bot:
         else:
             nc = self.z["next_center"]
             base = math.atan2(nc[1] - self.pos[1], nc[0] - self.pos[0])
-        sweep = math.sin(t * 0.9 + self.scan_phase) * 1.4
+        if self.cur_mode == "explore":
+            sweep = math.sin(t * 1.3 + self.scan_phase) * 2.4   # wide sweep: see more of the map
+        else:
+            sweep = math.sin(t * 0.9 + self.scan_phase) * 1.4
         out["aim"] = [wrap(base + sweep), 0.0]
 
 
