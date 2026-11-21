@@ -7,7 +7,7 @@ import time
 import mechfight as mf
 from world import World, Planner
 
-STRATEGY = "survive"   # or "fight" for the v3 behavior
+STRATEGY = "brawl"     # "brawl" (v5), "fight" (v3 behavior) or "survive" (v4 experiment)
 
 TAU = 2 * math.pi
 WEAPON_RANK = {"lightning": 3.0, "laser": 2.5, "mortar": 1.0, "gun": 0.0}
@@ -53,6 +53,26 @@ S_CUBE_D = 15.0
 S_HEAL_DONE = 0.90
 S_LEAVE_MARGIN = 15.0  # leave for the next spot when walk time + this would pass the next shrink
 S_SWEEP = math.radians(70)
+
+# v5: brawl (STRATEGY == "brawl")
+B_RUSH_BONUS = {"lightning": 400.0, "laser": 170.0, "mortar": 0.0}
+B_RUSH_MAX_D = {"lightning": 150.0, "laser": 120.0, "mortar": 40.0}
+B_MORTAR_UNTIL = 75.0          # don't take a mortar before this (something better usually turns up)
+B_LIGHTNING_BAND = (25.0, 35.0)
+B_GUN_PREF = 40.0
+B_ZIG = (0.4, 0.9)             # strafe flip interval while closing
+B_BOOST_CLOSE_D = 60.0
+B_MIN_FIGHT_ENERGY = 25.0      # keep this much for lightning: no boosting below it in a fight
+B_LASER_MIN_D = 45.0
+B_DUCK_D = 10.0
+B_PUNISH_S = 1.6
+B_HUNT_T = 90.0
+B_ENGAGE_D = 150.0             # in view and closer than this: go fight it
+B_LOOT_AFTER_KILL_S = 15.0
+B_LOOT_AFTER_KILL_D = 40.0
+B_HIDE_HPF = 0.35
+B_HEAL_START = 0.70
+B_FIGHT_MODES = ("fight", "commit", "chase", "hunt", "jink", "punish", "duck")
 
 
 def wrap(a):
@@ -127,6 +147,11 @@ class Bot:
         self.s_hiding = False
         self.s_hide_spot = None
         self.s_look = None         # (spot, yaw) most exposed direction from the current spot
+        # v5 brawl state
+        self.brawl = STRATEGY == "brawl"
+        self.zig_dir = 1
+        self.zig_until = 0.0
+        self.hunt_id = None
         mf.log(f"strategy {STRATEGY}")
         self.up_ids = [u["id"] for u in self.cfg.get("upgrades", [])]
         mf.log(f"upgrades in config: {self.up_ids}")
@@ -291,16 +316,23 @@ class Bot:
             if m["kind"] != "mech" or m["id"] == self.me_id:
                 continue
             prev = self.enemies.get(m["id"])
+            lf = prev.get("laser_fire_t", -99) if prev is not None else -99
             if m.get("charging"):
                 self.charge_seen_t = t
             elif prev is not None and prev.get("charging") and t - prev["t"] < 0.5:
                 self.laser_fire_t = t                    # it stopped charging: it fired
-            self.enemies[m["id"]] = dict(m, t=t, dmg_at_seen=self.dmg_dealt.get(m["id"], 0))
+                lf = t
+            self.enemies[m["id"]] = dict(m, t=t, dmg_at_seen=self.dmg_dealt.get(m["id"], 0), laser_fire_t=lf)
         for k in [k for k, e in self.enemies.items() if t - e["t"] > COMMIT_MEMORY]:
             del self.enemies[k]
         for s in obs["sounds"]:
             if s["kind"] == "laser":
                 self.laser_fire_t = max(self.laser_fire_t, t - s.get("age", 0))
+                # per-enemy: credit the shot to a known enemy on that bearing (within ~15 deg)
+                for e in self.enemies.values():
+                    b = math.atan2(e["pos"][1] - self.pos[1], e["pos"][0] - self.pos[0])
+                    if abs(wrap(b - s["bearing"])) < 0.26:
+                        e["laser_fire_t"] = max(e.get("laser_fire_t", -99), t - s.get("age", 0))
             if s["kind"] in ("gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"):
                 w = {"near": 2.0, "mid": 1.0, "far": 0.3}[s["dist"]]
                 self.threats.append((t - s.get("age", 0), s["bearing"], w))
@@ -437,6 +469,8 @@ class Bot:
             k = p["kind"]
             if k in held or k == "gun":
                 continue
+            if self.brawl and k == "mortar" and self.t < B_MORTAR_UNTIL:
+                continue
             if w[1] is None:
                 out["take"] = p["id"]
                 return
@@ -451,6 +485,8 @@ class Bot:
         held = {x["kind"] for x in w if x}
         k = p["kind"]
         if k in held or k == "gun":
+            return False
+        if self.brawl and k == "mortar" and self.t < B_MORTAR_UNTIL:
             return False
         if w[1] is None:
             return True
@@ -533,7 +569,11 @@ class Bot:
         # incoming mortar shells: sidestep
         dodge = self.mortar_dodge(obs)
 
-        hurt = hpf < 0.45 or (hpf < 0.55 and len(visible_mechs) >= 2)
+        if self.brawl:
+            hurt = hpf < B_HIDE_HPF
+            self.update_hunt(hpf)
+        else:
+            hurt = hpf < 0.45 or (hpf < 0.55 and len(visible_mechs) >= 2)
         if target is not None:
             tm = target[0]
             thpf = tm.get("hp", 1400) / max(1, tm.get("max_hp", 1400))
@@ -544,14 +584,19 @@ class Bot:
             thpf = 1.0
 
         in_zone_ok = me["in_zone"] and zone_ok_soon
-        duck = self.duck_cover(obs) if in_zone_ok else None
-        commit_step = self.commit_step(obs, target, hpf, home) if in_zone_ok and duck is None else None
+        laser_step = self.brawl_laser(obs) if in_zone_ok and self.brawl else None
+        duck = self.duck_cover(obs) if in_zone_ok and not self.brawl else None
+        commit_step = self.commit_step(obs, target, hpf, home) if in_zone_ok and duck is None and laser_step is None else None
+        hunt_step = self.hunt_step(target) if in_zone_ok and self.brawl else None
 
         if not in_zone_ok:
             mode = "zone"
             goal = self.pick_spot()
             move = self.go_to(goal)
             boost = (not me["in_zone"]) or not self.safe_at(pos2, t + 5, 4)
+        elif laser_step is not None:
+            # brawl: duck/jink a charging laser, then rush it during its cooldown
+            mode, move, boost = laser_step
         elif duck is not None:
             # a laser is charging on us from range: break line of sight, peek after it fires
             mode = "duck"
@@ -563,12 +608,16 @@ class Bot:
             mode = "hide"
             move = self.go_to(self.cover)
             boost = me["energy"] > 25
-        elif target is not None and target[1] and target[2] > self.engage_max() + 10 and thpf > 0.35 and self.have_cover(t):
+        elif not self.brawl and target is not None and target[1] and target[2] > self.engage_max() + 10 \
+                and thpf > 0.35 and self.have_cover(t):
             mode = "evade"
             move = self.go_to(self.cover)
             boost = me["energy"] > 40
-        elif target is not None and (target[1] or target[2] < self.engage_max()):
+        elif target is not None and (target[1] or target[2] < (B_ENGAGE_D if self.brawl else self.engage_max())):
             mode, move, boost = self.fight_move(target, hpf, home)
+        elif hunt_step is not None:
+            # brawl, early: the lone hunter is out of sight; go find it instead of waiting
+            mode, move, boost = hunt_step
         elif (t - self.last_mech_hit_t < 2.5 or (t - self.last_hit_t < 2.5 and not self.farm_ok(obs, hpf))) \
                 and self.have_cover(t):
             # while farming early, drone hits don't send us running for cover
@@ -584,6 +633,11 @@ class Bot:
         if dodge is not None:
             move = self.steer(dodge)
             boost = me["energy"] > 20
+
+        # brawl: save energy for lightning while fighting (the zone may still force a boost)
+        if self.brawl and mode in B_FIGHT_MODES and me["energy"] < B_MIN_FIGHT_ENERGY \
+                and self.weapon("lightning")[1] is not None:
+            boost = False
 
         # ----- aim / fire
         self.cur_mode = mode
@@ -878,7 +932,8 @@ class Bot:
         t = self.t
         m, vis, dist = target
         self.target_id = m["id"]
-        committed = m["id"] == self.commit_id
+        # brawl has no ambush: an enemy the server shows us is one to close on
+        committed = m["id"] == self.commit_id or self.brawl
         boost = False
         mode = "fight"
         pref = self.pref_range(m, hpf)
@@ -901,6 +956,8 @@ class Bot:
             if self.w.exposure(self.pos[0], self.pos[1]) > AMBUSH_EXPO and self.have_cover(t) \
                     and d2(self.cover, self.pos) < 25:
                 move = self.go_to(self.cover)
+        elif self.brawl and (self.weapon("lightning")[1] is not None or self.weapon("laser")[1] is None):
+            move, boost = self.brawl_close(m, dist)
         else:
             move = self.steer((ax * radial - ay * self.strafe_dir, ay * radial + ax * self.strafe_dir))
         # don't strafe out of the zone
@@ -932,12 +989,14 @@ class Bot:
 
     def update_heal(self, hpf):
         t = self.t
+        start = B_HEAL_START if self.brawl else HEAL_START
+        just_killed = t - self.last_kill_t < 1.0 and (not self.brawl or hpf < start)
         if hpf >= HEAL_DONE:
             if self.healing:
                 mf.log(f"t{t:.1f} healed")
             self.healing = False
             self.heal_spot = None
-        elif not self.healing and (t - self.last_kill_t < 1.0 or (t - self.last_enemy_seen_t >= 3 and hpf < HEAL_START)):
+        elif not self.healing and (just_killed or (t - self.last_enemy_seen_t >= 3 and hpf < start)):
             self.healing = True
             self.heal_spot = None
 
@@ -978,7 +1037,146 @@ class Bot:
             return 190
         return 75
 
+    # ------------------------------------------------------------------ v5: brawl
+    def zig(self):
+        t = self.t
+        if t > self.zig_until:
+            self.zig_dir = -self.zig_dir
+            self.zig_until = t + self.rng.uniform(*B_ZIG)
+        return self.zig_dir
+
+    def brawl_close(self, m, dist):
+        """Zigzag in to preferred range, around to the target's back if that's cheap. -> (move, boost)"""
+        me = self.me
+        if self.weapon("lightning")[1] is not None:
+            lo, hi = B_LIGHTNING_BAND
+        else:
+            lo, hi = B_GUN_PREF - 8, B_GUN_PREF + 8
+        tx, ty = m["pos"][0], m["pos"][1]
+        goal = (tx, ty)
+        if dist > hi + 10 and m.get("aim"):
+            # its front arc is 180 deg around its aim yaw; behind it, hits do 1.5x
+            yaw = m["aim"][0]
+            ang = math.atan2(self.pos[1] - ty, self.pos[0] - tx)
+            if abs(wrap(ang - yaw)) < math.pi / 2:
+                back = (tx - math.cos(yaw) * (lo + hi) / 2, ty - math.sin(yaw) * (lo + hi) / 2)
+                extra = d2(back, self.pos) - (dist - (lo + hi) / 2)
+                if extra < 40 and self.w.walkable(*back) and self.safe_at(back, self.t + 10, 6):
+                    goal = back
+        ax, ay = norm2(goal[0] - self.pos[0], goal[1] - self.pos[1])
+        z = self.zig()
+        if dist > hi:
+            fwd, side = 1.0, 0.45
+        elif dist < lo:
+            fwd, side = -0.6, 0.8
+        else:
+            fwd, side = 0.0, 1.0
+        move = self.steer((ax * fwd - ay * side * z, ay * fwd + ax * side * z))
+        return move, dist > B_BOOST_CLOSE_D and me["energy"] > 40
+
+    def brawl_laser(self, obs):
+        """Duck or jink a charging laser at range; rush it in the cooldown after it fires. -> (mode, move, boost)"""
+        t = self.t
+        me = self.me
+        cid = self.commit_id
+        if cid is not None:
+            e = self.enemies.get(cid)
+            est = self.est_hp(cid)
+            if e is not None and est is not None and est < 0.25 * e.get("max_hp", 1400):
+                return None                      # about to finish it: keep shooting
+        charger, cd = None, 1e9
+        for m in obs["mechs"]:
+            if m["kind"] == "mech" and m.get("charging"):
+                d = d2(m["pos"], self.pos)
+                if B_LASER_MIN_D < d < cd:
+                    charger, cd = m, d
+        if charger is not None:
+            if self.have_cover(t) and d2(self.cover, self.pos) <= B_DUCK_D:
+                return "duck", self.go_to(self.cover), me["energy"] > 20
+            ax, ay = norm2(charger["pos"][0] - self.pos[0], charger["pos"][1] - self.pos[1])
+            z = self.zig()
+            move = self.steer((-ay * z, ax * z))
+            nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+            if self.safe_at(nxt, t + 8, 6):
+                return "jink", move, me["energy"] > 25
+            return None
+        # punish window: it just fired, its laser is cooling down
+        best, bd = None, 1e9
+        for e in self.enemies.values():
+            if t - e.get("laser_fire_t", -99) < B_PUNISH_S and t - e["t"] < 2:
+                d = d2(e["pos"], self.pos)
+                if B_LIGHTNING_BAND[1] < d < bd:
+                    best, bd = e, d
+        if best is None:
+            return None
+        ax, ay = norm2(best["pos"][0] - self.pos[0], best["pos"][1] - self.pos[1])
+        z = self.zig()
+        if self.w.clear_walk(self.pos, best["pos"]):
+            move = self.steer((ax - ay * 0.25 * z, ay + ax * 0.25 * z))
+        else:
+            move = self.go_to((best["pos"][0], best["pos"][1]))
+        nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+        if not self.safe_at(nxt, t + 8, 6):
+            return None
+        return "punish", move, me["energy"] > 10
+
+    def update_hunt(self, hpf):
+        """First ~90 s: exactly one enemy seen recently -> that's the one to kill."""
+        t = self.t
+        recent = [eid for eid, e in self.enemies.items() if t - e["t"] < COMMIT_MEMORY]
+        hid = recent[0] if t < B_HUNT_T and len(recent) == 1 else None
+        if hid != self.hunt_id and hid is not None:
+            mf.log(f"t{t:.1f} hunting {hid}")
+        self.hunt_id = hid
+
+    def hunt_step(self, target):
+        """Hunter remembered but not in view: walk to its last known position (hp > 60%)."""
+        hid = self.hunt_id
+        if hid is None or self.me["hp"] / max(1, self.me["max_hp"]) <= 0.6:
+            return None
+        if target is not None and target[0]["id"] == hid:
+            return None                              # it's in obs: the fight branch handles it
+        e = self.enemies.get(hid)
+        if e is None:
+            return None
+        goal = (e["pos"][0], e["pos"][1])
+        move = self.go_to(goal)
+        nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+        if not self.safe_at(nxt, self.t + 8, 6):
+            return None
+        self.target_id = hid
+        return "hunt", move, d2(goal, self.pos) > B_BOOST_CLOSE_D and self.me["energy"] > 40
+
+    def loot_after_kill(self, obs):
+        """Cubes and weapons the dead mech dropped, within 40 m. -> (mode, move) or None"""
+        t = self.t
+        p = (self.pos[0], self.pos[1])
+        best = None
+        for c in obs["cubes"]:
+            q = (c["pos"][0], c["pos"][1])
+            d = d2(q, p)
+            if d < B_LOOT_AFTER_KILL_D and (best is None or d < best[0]) and self.w.walkable(*q) \
+                    and self.safe_at(q, t + 10, 6):
+                best = (d, "cube", q, None)
+        for pk in obs["pickups"]:
+            q = (pk["pos"][0], pk["pos"][1])
+            d = d2(q, p)
+            if d < B_LOOT_AFTER_KILL_D and self.want_pickup(pk) and (best is None or d < best[0]) \
+                    and t - self.loot_block.get(pk["id"], -999) >= 60 and self.safe_at(q, t + 10, 6):
+                best = (d, "loot", q, pk)
+        if best is None:
+            return None
+        if best[1] == "loot":
+            return "loot", self.loot_move(best[3])
+        return "cube", self.go_to(best[2])
+
     def pref_range(self, m, hpf):
+        if self.brawl:
+            if self.weapon("lightning")[1] is not None:
+                return sum(B_LIGHTNING_BAND) / 2
+            if self.weapon("laser")[1] is not None:
+                return 80
+            return B_GUN_PREF
         if self.weapon("lightning")[1] is not None and hpf > 0.5:
             return 28
         if self.weapon("laser")[1] is not None:
@@ -1030,6 +1228,9 @@ class Bot:
     def early_rush(self):
         w = self.me["weapons"]
         w1 = w[1] if len(w) > 1 else None
+        if self.brawl:
+            # brawl keeps rushing until it holds lightning (a laser is only a stopgap)
+            return self.t < RUSH_T and self.weapon("lightning")[1] is None
         return self.t < RUSH_T and not (w1 and w1["kind"] in ("lightning", "laser"))
 
     def farm_ok(self, obs, hpf):
@@ -1156,6 +1357,10 @@ class Bot:
         """Nothing to fight: loot cubes/weapons, farm drones/crates, capture drops, drift to zone."""
         t = self.t
         p = (self.pos[0], self.pos[1])
+        if self.brawl and t - self.last_kill_t < B_LOOT_AFTER_KILL_S:
+            got = self.loot_after_kill(obs)     # the dead mech's cubes and weapons, before healing
+            if got is not None:
+                return got
         if self.healing:
             return self.heal_goal(obs)          # no looting far away, farming or exploring while healing
         rush = self.early_rush()
@@ -1170,7 +1375,12 @@ class Bot:
             q = (pk["pos"][0], pk["pos"][1])
             d = d2(q, p)
             height = pk["pos"][2] - self.w.ground(*q)
-            if rush:
+            if rush and self.brawl:
+                if height > ROOF_MAX_H:
+                    continue
+                k = pk["kind"]
+                cands.append((d - B_RUSH_BONUS.get(k, 0), len(cands), q, "loot", B_RUSH_MAX_D.get(k, 40), d, pk, height < 2))
+            elif rush:
                 if height > ROOF_MAX_H:
                     continue
                 cands.append((d - RUSH_BONUS.get(pk["kind"], 0), len(cands), q, "loot", RUSH_MAX_D, d, pk, height < 2))
