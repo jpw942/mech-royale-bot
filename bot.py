@@ -7,6 +7,8 @@ import time
 import mechfight as mf
 from world import World, Planner
 
+STRATEGY = "survive"   # or "fight" for the v3 behavior
+
 TAU = 2 * math.pi
 WEAPON_RANK = {"lightning": 3.0, "laser": 2.5, "mortar": 1.0, "gun": 0.0}
 # Upgrade picks: survivability first, then upgrades for the weapons we hold (best weapon first),
@@ -40,6 +42,17 @@ DUCK_COVER_D = 12.0    # laser duck only to cover this close
 LASER_PEEK_S = 1.7     # stay ducked this long after a laser shot
 HEAL_START = 0.85
 HEAL_DONE = 0.90
+
+# v4 experiment: pure survival (STRATEGY == "survive")
+SURVIVE_UPS = ["armor", "plating", "nanites", "sensors"]
+S_IGNORE_D = 60.0      # visible enemies farther than this (and not hurting us) are only watched
+S_CLOSE_D = 35.0       # an enemy this close gets fought
+S_FINISH_HPF = 0.30    # keep fighting a visible enemy below this hp fraction
+S_LOOT_D = 25.0
+S_CUBE_D = 15.0
+S_HEAL_DONE = 0.90
+S_LEAVE_MARGIN = 15.0  # leave for the next spot when walk time + this would pass the next shrink
+S_SWEEP = math.radians(70)
 
 
 def wrap(a):
@@ -109,6 +122,12 @@ class Bot:
         mcfg = self.cfg.get("mech", {})
         self.regen_delay = mcfg.get("regen_delay", 5)
         self.regen_per_s = mcfg.get("regen_per_s", 45)
+        # v4 survive state
+        self.s_spot = None
+        self.s_hiding = False
+        self.s_hide_spot = None
+        self.s_look = None         # (spot, yaw) most exposed direction from the current spot
+        mf.log(f"strategy {STRATEGY}")
         self.up_ids = [u["id"] for u in self.cfg.get("upgrades", [])]
         mf.log(f"upgrades in config: {self.up_ids}")
         unknown = [u for u in UPGRADE_PREF if u not in self.up_ids]
@@ -493,6 +512,9 @@ class Bot:
             best = min(range(len(ids)), key=lambda i: rank.get(ids[i], 999))
             out["pick"] = best
 
+        if STRATEGY == "survive":
+            return self.act_survive(obs, out, tick_start)
+
         hpf = me["hp"] / max(1, me["max_hp"])
         pos2 = (self.pos[0], self.pos[1])
         visible_mechs = [m for m in obs["mechs"] if m["kind"] == "mech" and m["id"] != self.me_id]
@@ -594,6 +616,186 @@ class Bot:
         self.plan.step(max(0.0, 0.010 - spent))
         self.mode = mode
         mf.draw.label(f"{mode} hp{hpf:.2f} e{me['energy']:.0f}" + (f" c{self.commit_id}" if self.commit_id is not None else ""))
+        return out
+
+    # ------------------------------------------------------------------ v4: pure survival
+    def survive_spot(self):
+        """Stay at the current spot until walking to the next one (+ margin) would run into the shrink."""
+        t = self.t
+        nxt = self.pick_spot()
+        cur = self.s_spot
+        if cur is None or cur == nxt:
+            self.s_spot = nxt
+            return nxt
+        eta = d2(nxt, self.pos) * 1.3 / 4.5          # path detour, quiet walking speed
+        if t + eta + S_LEAVE_MARGIN >= self.z["shrink_start"] or not self.safe_at(cur, t + eta + S_LEAVE_MARGIN, 8):
+            mf.log(f"t{t:.1f} moving to next spot, eta {eta:.0f}s")
+            self.s_spot = nxt
+        return self.s_spot
+
+    def look_dir(self, spot):
+        """Yaw with the longest open sight line from `spot` (where hunters can see us from), cached per spot."""
+        if self.s_look is not None and self.s_look[0] == spot:
+            return self.s_look[1]
+        nc = self.z["next_center"]
+        yaw = math.atan2(nc[1] - spot[1], nc[0] - spot[0])
+        gz = self.w.ground(*spot)
+        eye = (spot[0], spot[1], gz + 8)
+        deadline = time.perf_counter() + 0.005
+        best = -1
+        for k in range(8):
+            a = k * TAU / 8
+            open_m = 0
+            for r in (40, 80, 120):
+                if time.perf_counter() > deadline:
+                    break
+                q = (spot[0] + math.cos(a) * r, spot[1] + math.sin(a) * r)
+                if not self.w.los(eye, (q[0], q[1], self.w.ground(*q) + 5)):
+                    break
+                open_m = r
+            if open_m > best:
+                best, yaw = open_m, (a if open_m > 0 else yaw)
+        self.s_look = (spot, yaw)
+        return yaw
+
+    def act_survive(self, obs, out, tick_start):
+        t = self.t
+        me = self.me
+        hpf = me["hp"] / max(1, me["max_hp"])
+        pos2 = (self.pos[0], self.pos[1])
+        mz = self.muzzle()
+        tb = self.threat_bearing()
+        zone_ok_soon = self.safe_at(pos2, t + 12, 10)
+
+        # visible enemies, nearest first; line of sight for the nearest few only
+        vis_list = []
+        for m in obs["mechs"]:
+            if m["kind"] == "mech" and m["id"] != self.me_id:
+                vis_list.append((d2(m["pos"], self.pos), len(vis_list), m))
+        vis_list.sort()
+        if vis_list:
+            self.last_enemy_seen_t = t
+        enemies = []
+        for k, (d, _, m) in enumerate(vis_list):
+            los = k < 4 and self.w.los(mz, self.mech_center(m))
+            hpf_m = m.get("hp", 1400) / max(1, m.get("max_hp", 1400))
+            enemies.append((d, m, los, hpf_m))
+
+        hit_recent = t - self.last_mech_hit_t < 2.5
+        if hit_recent:
+            self.s_hiding = True                     # once hit, regen behind cover before moving on
+        attacker = None
+        for e in enemies:
+            if hit_recent and e[1]["id"] == self.last_dmg_by:
+                attacker = e
+        near = [e for e in enemies if e[0] <= S_CLOSE_D]
+        finisher = None
+        for e in enemies:
+            if e[2] and e[3] < S_FINISH_HPF and e[0] <= S_IGNORE_D:
+                finisher = e
+                break
+        covered = (hit_recent or near) and self.have_cover(t)
+
+        move, boost, mode, tgt = [0.0, 0.0], False, "camp", None
+        if not me["in_zone"] or not zone_ok_soon:
+            mode = "zone"
+            move = self.go_to(self.pick_spot())
+            boost = (not me["in_zone"]) or not self.safe_at(pos2, t + 5, 4)
+            tgt = attacker or (near[0] if near else None)
+        elif near or finisher or (hit_recent and not covered):
+            # forced to fight: shoot back, still prefer cover (unless we're finishing someone)
+            mode = "fight"
+            tgt = finisher or (min(near, key=lambda e: e[3] * 3 + e[0] / 35) if near else None) or attacker \
+                or (enemies[0] if enemies else None)
+            if covered and finisher is None:
+                move = self.go_to(self.cover)
+                boost = me["energy"] > 25
+            elif tgt is not None:
+                ax, ay = norm2(tgt[1]["pos"][0] - self.pos[0], tgt[1]["pos"][1] - self.pos[1])
+                if t > self.strafe_until:
+                    self.strafe_dir = self.rng.choice((-1, 1))
+                    self.strafe_until = t + self.rng.uniform(0.5, 1.4)
+                radial = -0.5 if tgt[0] < 20 else 0.0     # sidestep, never close in
+                move = self.steer((ax * radial - ay * self.strafe_dir, ay * radial + ax * self.strafe_dir))
+                nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
+                if not self.safe_at(nxt, t + 8, 6):
+                    move = [0.0, 0.0]
+        elif hit_recent:
+            # being shot from range and cover exists: get out of sight, shoot back only if they're close
+            mode = "evade"
+            self.s_hide_spot = self.cover
+            move = self.go_to(self.cover)
+            boost = me["energy"] > 25
+            if attacker is not None and attacker[0] <= S_IGNORE_D:
+                tgt = attacker
+        elif self.s_hiding and hpf < S_HEAL_DONE:
+            mode = "hide"
+            sp = self.s_hide_spot
+            if sp is None or not self.safe_at(sp, t + 10, 5):
+                sp = self.s_hide_spot = (self.cover if self.have_cover(t) else None) or self.survive_spot()
+            if d2(sp, pos2) > 3:
+                move = self.go_to(sp)
+        else:
+            if self.s_hiding:
+                mf.log(f"t{t:.1f} regen done hp{hpf:.2f}")
+            self.s_hiding = False
+            self.s_hide_spot = None
+            spot = self.survive_spot()
+            mode, move = "camp", [0.0, 0.0]
+            no_enemy_5s = t - self.last_enemy_seen_t > 5
+            # a weapon right next to us, only when it's quiet
+            for pk in obs["pickups"]:
+                q = (pk["pos"][0], pk["pos"][1])
+                if (no_enemy_5s and d2(q, pos2) < S_LOOT_D and self.want_pickup(pk)
+                        and abs(pk["pos"][2] - self.w.ground(*q)) < 2 and self.safe_at(q, t + 15, 8)):
+                    mode, move = "loot", self.go_to(q)
+                    break
+            if mode == "camp" and not enemies:
+                for c in obs["cubes"]:
+                    q = (c["pos"][0], c["pos"][1])
+                    if d2(q, pos2) < S_CUBE_D and self.w.walkable(*q) and self.safe_at(q, t + 10, 6):
+                        mode, move = "cube", self.go_to(q)
+                        break
+            if mode == "camp" and d2(spot, pos2) > 3:
+                mode, move = "roam", self.go_to(spot)
+
+        dodge = self.mortar_dodge(obs) if mode != "zone" else None
+        if dodge is not None:
+            move = self.steer(dodge)
+            boost = me["energy"] > 20
+
+        # ----- aim: shoot only when forced, otherwise face whoever is out there
+        self.cur_mode = mode
+        rear = self.rear_hit is not None and t - self.rear_hit[0] < 1.0
+        if tgt is not None:
+            m = tgt[1]
+            self.shoot(self.mech_center(m), m["vel"], tgt[2], out)
+        elif rear:
+            out["aim"] = [self.rear_hit[1], 0.0]
+        elif enemies:
+            out["aim"] = self.aim_to(self.mech_center(enemies[0][1]))   # watch, don't shoot
+        elif tb is not None:
+            out["aim"] = [tb, 0.0]
+        else:
+            base = self.look_dir(self.s_spot or pos2)
+            out["aim"] = [wrap(base + math.sin(t * 0.5 + self.scan_phase) * S_SWEEP), 0.0]
+        if tgt is None:
+            out["fire"] = [False, False]
+
+        self.manage_loot(obs, out)
+
+        # silent walking unless the zone (or incoming fire) makes us hurry
+        if mode not in ("zone", "fight", "evade") and not boost:
+            sp = self.cfg["sound"]["step_speed"] / max(1, self.stats.get("walk_speed", 11.7))
+            move = [move[0] * sp * 0.92, move[1] * sp * 0.92]
+
+        out["move"] = move
+        out["boost"] = bool(boost)
+        self.unstick(move, out)
+        spent = time.perf_counter() - tick_start
+        self.plan.step(max(0.0, 0.010 - spent))
+        self.mode = mode
+        mf.draw.label(f"S:{mode} hp{hpf:.2f} e{me['energy']:.0f}")
         return out
 
     # ------------------------------------------------------------------ v3: fight smarter
@@ -813,7 +1015,7 @@ class Bot:
     def upgrade_rank(self):
         """id -> rank (lower is better): survival, held-weapon upgrades, general, the rest."""
         held = sorted({w["kind"] for w in self.me["weapons"] if w}, key=lambda k: -WEAPON_RANK.get(k, 0))
-        order = list(SURVIVAL_UPS)
+        order = list(SURVIVE_UPS if STRATEGY == "survive" else SURVIVAL_UPS)
         for k in held:
             order += WEAPON_UPS.get(k, [])
         order += GENERAL_UPS
@@ -1019,14 +1221,20 @@ class Bot:
         if sp is not None and self.spot_key == key and self.safe_at(sp, z["shrink_end"], 10):
             return sp
         nc, nr = z["next_center"], z["next_radius"]
+        survive = STRATEGY == "survive"
         best, bs = None, 1e9
         for k in range(90):
             a = self.rng.random() * TAU
-            r = math.sqrt(self.rng.random()) * max(nr * 0.75, 3)
+            r = math.sqrt(self.rng.random()) * max(nr * (0.55 if survive else 0.75), 3)
             q = (nc[0] + math.cos(a) * r, nc[1] + math.sin(a) * r)
             if not self.w.walkable(*q):
                 continue
-            sc = self.w.exposure(*q) + 0.25 * d2(q, p) + 0.15 * d2(q, nc)
+            if survive:
+                # hidden first, and deep inside the next circle so the circle after it likely covers us too
+                dc = d2(q, nc)
+                sc = 2.0 * self.w.exposure(*q) + 0.25 * d2(q, p) + 0.5 * dc + 4.0 * max(0.0, dc - 0.4 * nr)
+            else:
+                sc = self.w.exposure(*q) + 0.25 * d2(q, p) + 0.15 * d2(q, nc)
             if sc < bs:
                 bs, best = sc, q
         if best is None:

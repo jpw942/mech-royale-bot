@@ -132,7 +132,7 @@ class Planner:
         end = time.perf_counter() + budget_s
         try:
             while time.perf_counter() < end:
-                for _ in range(200):
+                for _ in range(4):           # _astar yields every 50 expansions: check the clock every ~200
                     r = next(self.job)
                     if r is not None:
                         self.path = r
