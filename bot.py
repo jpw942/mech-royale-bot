@@ -7,7 +7,7 @@ import time
 import mechfight as mf
 from world import World, Planner
 
-STRATEGY = "brawl"     # "brawl" (v5), "fight" (v3 behavior) or "survive" (v4 experiment)
+STRATEGY = "brawl2"    # "brawl2" (v6), "brawl" (v5), "fight" (v3 behavior) or "survive" (v4 experiment)
 
 TAU = 2 * math.pi
 WEAPON_RANK = {"lightning": 3.0, "laser": 2.5, "mortar": 1.0, "gun": 0.0}
@@ -73,6 +73,27 @@ B_LOOT_AFTER_KILL_D = 40.0
 B_HIDE_HPF = 0.35
 B_HEAL_START = 0.70
 B_FIGHT_MODES = ("fight", "commit", "chase", "hunt", "jink", "punish", "duck")
+
+# v6: brawl2 (everything in brawl, plus these)
+# loadout value by the pair of kinds held (None = empty slot); swaps only go up this table
+B2_LOADOUT = {
+    frozenset(["lightning", "laser"]): 10, frozenset(["lightning", "mortar"]): 7,
+    frozenset(["laser", "gun"]): 7, frozenset(["lightning", "gun"]): 6,
+    frozenset(["laser", "mortar"]): 5, frozenset(["gun", "mortar"]): 2,
+    frozenset(["lightning"]): 5, frozenset(["laser"]): 4, frozenset(["gun"]): 1, frozenset(["mortar"]): 1.5,
+    frozenset(): 0,
+}
+B2_SWAP_FIGHT_D = 60.0       # mid-fight, only swap weapons if the target is farther than this
+B2_LIGHTNING_D = 40.0        # lightning range band for shoot()
+B2_SNOWBALL_T = 60.0         # farm drones/crates until this, or until the first enemy mech is seen
+B2_FARM_LIGHTNING_BAND = (25.0, 38.0)   # drone stand-off when lightning is our weapon
+B2_BAD_CHARGE_MODES = ("jink", "punish", "duck", "chase", "hunt", "zone", "hide", "evade")
+B2_UPS = {
+    "lightning": ["lightning_efficiency", "lightning_chain"],
+    "laser": ["laser_damage", "laser_charge"],
+    "gun": ["gun_damage", "gun_rate"],
+    "mortar": ["mortar_reload"],
+}
 
 
 def wrap(a):
@@ -148,7 +169,9 @@ class Bot:
         self.s_hide_spot = None
         self.s_look = None         # (spot, yaw) most exposed direction from the current spot
         # v5 brawl state
-        self.brawl = STRATEGY == "brawl"
+        self.brawl = STRATEGY in ("brawl", "brawl2")
+        self.brawl2 = STRATEGY == "brawl2"
+        self.cur_target_d = None
         self.zig_dir = 1
         self.zig_until = 0.0
         self.hunt_id = None
@@ -376,6 +399,8 @@ class Bot:
     # ------------------------------------------------------------------ weapons
     def shoot(self, tgt_pos, tgt_vel, vis, out, is_mech=True, radius=2.5):
         """Aim and fire everything sensible at a target point (center)."""
+        if self.brawl2:
+            return self.shoot_b2(tgt_pos, tgt_vel, vis, out, is_mech, radius)
         me = self.me
         mz = self.muzzle()
         dist = math.dist(tgt_pos, mz)
@@ -438,6 +463,75 @@ class Bot:
         if gun is not None and gun.get("ammo", 1) == 0 and gun.get("reload", 0) == 0:
             out["reload"] = True
 
+    def shoot_b2(self, tgt_pos, tgt_vel, vis, out, is_mech=True, radius=2.5):
+        """brawl2 shooting; works with any loadout (the gun may be gone, slots looked up by kind).
+        <= 40 m: lightning, laser only when charging won't slow us at a bad moment.
+        40-280 m: laser, aimed dead center (hitscan, no lead), released when full and on target."""
+        me = self.me
+        mz = self.muzzle()
+        dist = math.dist(tgt_pos, mz)
+        actual = me["aim"]
+        fire = [False] * max(2, len(me["weapons"]))
+        gi, gun = self.weapon("gun")
+        li, lit = self.weapon("lightning")
+        ri, las = self.weapon("laser")
+        mi, mor = self.weapon("mortar")
+        aim = None
+        lit_ok = lit is not None and vis and dist < lit["stats"]["range"] * 0.95
+
+        laser_release = False
+        if las is not None and is_mech and vis and dist < las["stats"].get("range", 280) * 0.95:
+            full = las["stats"].get("charge", 0.75)
+            ch = las.get("charge", 0) or 0
+            close = dist <= B2_LIGHTNING_D
+            start_ok = self.cur_mode not in B2_BAD_CHARGE_MODES and \
+                (not close or lit is None or dist <= B_LIGHTNING_BAND[1])
+            if ch > 0 or start_ok:
+                exact = self.aim_to(tgt_pos)
+                aim = exact
+                if ch >= full - 0.06:
+                    err = abs(wrap(actual[0] - exact[0])) + abs(actual[1] - exact[1])
+                    if err < max(math.atan2(radius * 0.7, dist), 0.01):
+                        laser_release = True      # fire = False releases the beam
+                    else:
+                        fire[ri] = True
+                elif ch > 0:
+                    fire[ri] = True               # keep charging
+                elif las["cooldown"] <= 0.05 and abs(wrap(actual[0] - exact[0])) < 0.4:
+                    fire[ri] = True
+
+        if aim is None:
+            p = self.lead(tgt_pos, tgt_vel, gun["stats"]["speed"]) if gun is not None and vis else tgt_pos
+            aim = self.aim_to(p)
+
+        # mortar: lob when there's no line of sight, or nothing else reaches
+        if mor is not None and is_mech and 25 < dist < 220 and (not vis or (gun is None and las is None and not lit_ok)):
+            ma = self.mortar_aim(tgt_pos, tgt_vel, mor["stats"], high=not vis)
+            if ma is not None:
+                aim = ma
+                err = abs(wrap(actual[0] - ma[0])) + abs(actual[1] - ma[1])
+                if err < 0.04 and mor["cooldown"] <= 0:
+                    fire[mi] = True
+
+        err_y = abs(wrap(actual[0] - aim[0]))
+        err_p = abs(actual[1] - aim[1])
+        tol = max(math.atan2(radius * 0.8, max(dist, 1)), 0.012)
+        if gun is not None and vis and dist < min(gun["stats"]["range"], 140 if is_mech else 120) and err_y < tol and err_p < tol * 1.5:
+            if not (las is not None and fire[ri] and (las.get("charge", 0) or 0) > 0.5):
+                fire[gi] = True
+        if lit_ok and lit["cooldown"] <= 0 and me["energy"] > lit["stats"]["energy"] + 6:
+            half = math.radians(lit["stats"]["cone_deg"]) / 2
+            # whenever the target is inside the cone (measured from the real target, not a mortar arc)
+            ex = self.aim_to(tgt_pos)
+            if abs(wrap(actual[0] - ex[0])) < half * 0.9 and abs(actual[1] - ex[1]) < half:
+                fire[li] = True
+        if laser_release:
+            fire[ri] = False
+        out["aim"] = aim
+        out["fire"] = fire[:2]
+        if gun is not None and gun.get("ammo", 1) == 0 and gun.get("reload", 0) == 0:
+            out["reload"] = True
+
     def mortar_aim(self, p, v, st, high):
         src = (self.pos[0], self.pos[1], self.pos[2] + self.stats.get("height", 9) + 0.5)
         spd, g = st["speed"], st["gravity"]
@@ -456,9 +550,49 @@ class Bot:
         th = max(self.cfg["mech"]["min_pitch"], min(self.cfg["mech"]["max_pitch"] - 0.02, th))
         return [math.atan2(dy, dx), th]
 
+    def loadout_value(self, kinds):
+        return B2_LOADOUT.get(frozenset(k for k in kinds if k), 0)
+
+    def best_swap(self, kind):
+        """brawl2: (slot to fill/replace, new value) if taking `kind` improves the loadout, else None.
+        Slots are looked up per index; never replaces a charging laser."""
+        w = self.me["weapons"]
+        cur = [x["kind"] if x else None for x in w]
+        if kind in cur:
+            return None
+        if self.brawl and kind == "mortar" and self.t < B_MORTAR_UNTIL:
+            return None
+        base = self.loadout_value(cur)
+        best = None
+        for s in range(len(w)):
+            if w[s] is not None and w[s]["kind"] == "laser" and (w[s].get("charge") or 0) > 0:
+                continue
+            new = list(cur)
+            new[s] = kind
+            v = self.loadout_value(new)
+            # prefer filling an empty slot over replacing at equal value
+            if v > base + 0.1 and (best is None or v > best[1] or (v == best[1] and w[s] is None)):
+                best = (s, v)
+        return best
+
     def manage_loot(self, obs, out):
         """Take better weapons we're standing next to."""
         reach = self.cfg["loot"]["pickup_radius"] - 0.3
+        if self.brawl2:
+            if self.cur_target_d is not None and self.cur_target_d <= B2_SWAP_FIGHT_D:
+                return                                   # mid-fight up close: no 1 s equip pause
+            for p in obs["pickups"]:
+                if d2(p["pos"], self.pos) > reach or abs(p["pos"][2] - self.pos[2]) > 3.8:
+                    continue
+                sw = self.best_swap(p["kind"])
+                if sw is None:
+                    continue
+                out["take"] = p["id"]
+                if self.me["weapons"][sw[0]] is not None:
+                    out["drop"] = sw[0]
+                    mf.log(f"t{self.t:.1f} swap slot {sw[0]} {self.me['weapons'][sw[0]]['kind']} -> {p['kind']}")
+                return
+            return
         w = self.me["weapons"]
         held = {x["kind"] for x in w if x}
         for p in obs["pickups"]:
@@ -481,6 +615,8 @@ class Bot:
                 return
 
     def want_pickup(self, p):
+        if self.brawl2:
+            return self.best_swap(p["kind"]) is not None
         w = self.me["weapons"]
         held = {x["kind"] for x in w if x}
         k = p["kind"]
@@ -559,6 +695,7 @@ class Bot:
         self.update_commit(obs)
         self.update_heal(hpf)
         target = self.pick_target(obs)
+        self.cur_target_d = target[2] if target is not None else None
         tb = self.threat_bearing()
         home = self.zone_home(pos2)
         zone_ok_soon = self.safe_at(pos2, t + 12, 10)
@@ -1213,6 +1350,13 @@ class Bot:
     def upgrade_rank(self):
         """id -> rank (lower is better): survival, held-weapon upgrades, general, the rest."""
         held = sorted({w["kind"] for w in self.me["weapons"] if w}, key=lambda k: -WEAPON_RANK.get(k, 0))
+        if self.brawl2:
+            # damage first: held weapons' damage/rate, then armor, max hp, then the rest
+            order = [u for k in held for u in B2_UPS.get(k, [])] + ["armor", "plating"]
+            rank = {}
+            for u in order + UPGRADE_PREF + self.up_ids:
+                rank.setdefault(u, len(rank))
+            return rank
         order = list(SURVIVE_UPS if STRATEGY == "survive" else SURVIVAL_UPS)
         for k in held:
             order += WEAPON_UPS.get(k, [])
@@ -1228,6 +1372,9 @@ class Bot:
     def early_rush(self):
         w = self.me["weapons"]
         w1 = w[1] if len(w) > 1 else None
+        if self.brawl2:
+            # rush until the lightning + laser loadout is complete
+            return self.t < RUSH_T and (self.weapon("lightning")[1] is None or self.weapon("laser")[1] is None)
         if self.brawl:
             # brawl keeps rushing until it holds lightning (a laser is only a stopgap)
             return self.t < RUSH_T and self.weapon("lightning")[1] is None
@@ -1235,7 +1382,12 @@ class Bot:
 
     def farm_ok(self, obs, hpf):
         """Early, healthy, no mech shooting us and no hunter within 90 m."""
-        if self.t >= FARM_T or hpf <= 0.6 or self.t - self.last_mech_hit_t < 4:
+        if self.brawl2 and self.weapon("gun")[1] is None and self.weapon("lightning")[1] is None:
+            return False                         # laser/mortar only: nothing that hits drones or crates
+        snowball = self.brawl2 and self.t < B2_SNOWBALL_T and self.last_enemy_seen_t < 0 and hpf > 0.5
+        if not snowball and (self.t >= FARM_T or hpf <= 0.6):
+            return False
+        if self.t - self.last_mech_hit_t < 4:
             return False
         for m in obs["mechs"]:
             if m["kind"] == "mech" and m["id"] != self.me_id and d2(m["pos"], self.pos) <= 90:
@@ -1288,14 +1440,17 @@ class Bot:
             if d > 30 or not ft["vis"]:
                 return self.go_to((tx, ty))
             return [0.0, 0.0]
-        # drone: hold 35-50 m and keep strafing so its shots miss
-        if d > 48 or not ft["vis"]:
+        # drone: hold 35-50 m and keep strafing so its shots miss (closer when lightning is all we have)
+        lo, hi = 35, 48
+        if self.brawl2 and self.weapon("gun")[1] is None:
+            lo, hi = B2_FARM_LIGHTNING_BAND
+        if d > hi or not ft["vis"]:
             return self.go_to((tx, ty))
         ax, ay = norm2(tx - self.pos[0], ty - self.pos[1])
         if t > self.strafe_until:
             self.strafe_dir = self.rng.choice((-1, 1))
             self.strafe_until = t + self.rng.uniform(0.6, 1.5)
-        radial = -0.8 if d < 35 else 0.0
+        radial = -0.8 if d < lo else 0.0
         move = self.steer((ax * radial - ay * self.strafe_dir * 0.7, ay * radial + ax * self.strafe_dir * 0.7))
         nxt = (self.pos[0] + move[0] * 15, self.pos[1] + move[1] * 15)
         if not self.safe_at(nxt, t + 10, 6):
