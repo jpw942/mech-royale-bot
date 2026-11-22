@@ -7,7 +7,7 @@ import time
 import mechfight as mf
 from world import World, Planner
 
-STRATEGY = "brawl2"    # "brawl2" (v6), "brawl" (v5), "fight" (v3 behavior) or "survive" (v4 experiment)
+STRATEGY = "snipe"     # "snipe" (v7 experiment), "brawl2" (v6), "brawl" (v5), "fight" (v3), "survive" (v4)
 
 TAU = 2 * math.pi
 WEAPON_RANK = {"lightning": 3.0, "laser": 2.5, "mortar": 1.0, "gun": 0.0}
@@ -88,6 +88,16 @@ B2_LIGHTNING_D = 40.0        # lightning range band for shoot()
 B2_SNOWBALL_T = 60.0         # farm drones/crates until this, or until the first enemy mech is seen
 B2_FARM_LIGHTNING_BAND = (25.0, 38.0)   # drone stand-off when lightning is our weapon
 B2_BAD_CHARGE_MODES = ("jink", "punish", "duck", "chase", "hunt", "zone", "hide", "evade")
+# v7: snipe (everything in brawl, except these)
+SN_RANK = {"laser": 3.0, "lightning": 2.5, "mortar": 1.0, "gun": 0.0}   # for the non-gun slot
+SN_RUSH_BONUS = {"laser": 400.0, "lightning": 170.0, "mortar": 0.0}
+SN_RUSH_MAX_D = {"laser": 150.0, "lightning": 120.0, "mortar": 40.0}
+SN_MIN_D = 60.0              # long range band for peek-sniping
+SN_MAX_D = 250.0
+SN_GUN_MAX_D = 100.0         # in snipe mode, the gun only fires inside this
+SN_SWAP_FIGHT_D = 60.0
+SN_REPLAN_S = 4.0            # recompute cover/peek spots this often
+SN_PEEK_R = (3.0, 5.0, 8.0, 11.0)
 B2_UPS = {
     "lightning": ["lightning_efficiency", "lightning_chain"],
     "laser": ["laser_damage", "laser_charge"],
@@ -169,8 +179,11 @@ class Bot:
         self.s_hide_spot = None
         self.s_look = None         # (spot, yaw) most exposed direction from the current spot
         # v5 brawl state
-        self.brawl = STRATEGY in ("brawl", "brawl2")
+        self.brawl = STRATEGY in ("brawl", "brawl2", "snipe")
         self.brawl2 = STRATEGY == "brawl2"
+        self.snipe = STRATEGY == "snipe"
+        self.sn = None             # peek plan: dict(tid, tpos, t, cover, peek)
+        self.sn_phase = ""
         self.cur_target_d = None
         self.zig_dir = 1
         self.zig_until = 0.0
@@ -593,8 +606,12 @@ class Bot:
                     mf.log(f"t{self.t:.1f} swap slot {sw[0]} {self.me['weapons'][sw[0]]['kind']} -> {p['kind']}")
                 return
             return
+        if self.snipe and self.cur_target_d is not None and self.cur_target_d <= SN_SWAP_FIGHT_D:
+            return                                       # snipe: no swapping mid-fight
         w = self.me["weapons"]
         held = {x["kind"] for x in w if x}
+        sp = self.special_slot()
+        rank = SN_RANK if self.snipe else WEAPON_RANK
         for p in obs["pickups"]:
             if abs(p["pos"][0] - self.pos[0]) > reach + 2 or abs(p["pos"][1] - self.pos[1]) > reach + 2:
                 continue
@@ -605,14 +622,22 @@ class Bot:
                 continue
             if self.brawl and k == "mortar" and self.t < B_MORTAR_UNTIL:
                 continue
-            if w[1] is None:
+            if w[sp] is None:
                 out["take"] = p["id"]
                 return
-            cur = w[1]["kind"]
-            if WEAPON_RANK[k] > WEAPON_RANK.get(cur, 0) + 0.2 and not (cur == "laser" and (w[1].get("charge") or 0) > 0):
+            cur = w[sp]["kind"]
+            if rank[k] > rank.get(cur, 0) + 0.2 and not (cur == "laser" and (w[sp].get("charge") or 0) > 0):
                 out["take"] = p["id"]
-                out["drop"] = 1
+                out["drop"] = sp
                 return
+
+    def special_slot(self):
+        """The slot we put found weapons in: 1, or for snipe whichever slot isn't the gun (never drop it)."""
+        if self.snipe:
+            gi, _ = self.weapon("gun")
+            if gi is not None:
+                return 1 - gi
+        return 1
 
     def want_pickup(self, p):
         if self.brawl2:
@@ -624,9 +649,11 @@ class Bot:
             return False
         if self.brawl and k == "mortar" and self.t < B_MORTAR_UNTIL:
             return False
-        if w[1] is None:
+        sp = self.special_slot()
+        rank = SN_RANK if self.snipe else WEAPON_RANK
+        if w[sp] is None:
             return True
-        return WEAPON_RANK[k] > WEAPON_RANK.get(w[1]["kind"], 0) + 0.2
+        return rank[k] > rank.get(w[sp]["kind"], 0) + 0.2
 
     # ------------------------------------------------------------------ cover
     def find_cover(self, threats):
@@ -721,9 +748,13 @@ class Bot:
             thpf = 1.0
 
         in_zone_ok = me["in_zone"] and zone_ok_soon
-        laser_step = self.brawl_laser(obs) if in_zone_ok and self.brawl else None
+        snipe_step = self.snipe_step(obs, target, hpf) if in_zone_ok and self.snipe else None
+        if snipe_step is None:
+            self.sn_phase = ""
+        laser_step = self.brawl_laser(obs) if in_zone_ok and self.brawl and snipe_step is None else None
         duck = self.duck_cover(obs) if in_zone_ok and not self.brawl else None
-        commit_step = self.commit_step(obs, target, hpf, home) if in_zone_ok and duck is None and laser_step is None else None
+        commit_step = self.commit_step(obs, target, hpf, home) \
+            if in_zone_ok and duck is None and laser_step is None and snipe_step is None else None
         hunt_step = self.hunt_step(target) if in_zone_ok and self.brawl else None
 
         if not in_zone_ok:
@@ -731,6 +762,9 @@ class Bot:
             goal = self.pick_spot()
             move = self.go_to(goal)
             boost = (not me["in_zone"]) or not self.safe_at(pos2, t + 5, 4)
+        elif snipe_step is not None:
+            # snipe: long-range laser peeks from cover
+            mode, move, boost = snipe_step
         elif laser_step is not None:
             # brawl: duck/jink a charging laser, then rush it during its cooldown
             mode, move, boost = laser_step
@@ -778,7 +812,9 @@ class Bot:
 
         # ----- aim / fire
         self.cur_mode = mode
-        if target is not None:
+        if mode == "snipe" and target is not None:
+            self.snipe_shoot(target, out)
+        elif target is not None:
             m, vis, dist = target
             self.shoot(self.mech_center(m), m["vel"], vis, out)
         elif self.commit_id in self.enemies:
@@ -790,6 +826,12 @@ class Bot:
         # hit from behind with nothing in view: turn the front armor toward it now
         if target is None and self.rear_hit is not None and t - self.rear_hit[0] < 1.0:
             out["aim"] = [self.rear_hit[1], 0.0]
+        if self.snipe and mode != "snipe":
+            # don't dump a laser charge into a wall: hold it (it fires itself after hold_s) unless we can see
+            ri, las = self.weapon("laser")
+            if las is not None and (las.get("charge") or 0) > 0 and "fire" in out \
+                    and not (target is not None and target[1]):
+                out["fire"][ri] = True
 
         self.manage_loot(obs, out)
 
@@ -806,8 +848,117 @@ class Bot:
         spent = time.perf_counter() - tick_start
         self.plan.step(max(0.0, 0.010 - spent))
         self.mode = mode
-        mf.draw.label(f"{mode} hp{hpf:.2f} e{me['energy']:.0f}" + (f" c{self.commit_id}" if self.commit_id is not None else ""))
+        mf.draw.label(f"{mode}{(':' + self.sn_phase) if self.sn_phase else ''} hp{hpf:.2f} e{me['energy']:.0f}"
+                      + (f" c{self.commit_id}" if self.commit_id is not None else ""))
         return out
+
+    # ------------------------------------------------------------------ v7: snipe
+    def snipe_plan(self, m):
+        """Cover hidden from the target, plus the nearest spot beside it with line of sight to the target."""
+        t = self.t
+        tc = self.mech_center(m)
+        sn = self.sn
+        if (sn is not None and sn["tid"] == m["id"] and t - sn["t"] < SN_REPLAN_S and d2(sn["tpos"], tc) < 15
+                and (sn["cover"] is None or self.safe_at(sn["cover"], t + 10, 5))):
+            return sn
+        cover = self.find_cover([tc])                       # time-guarded (8 ms)
+        peek = None
+        if cover is not None:
+            deadline = time.perf_counter() + 0.004
+            mh = self.stats.get("muzzle_height", 7)
+            for r in SN_PEEK_R:
+                for k in range(8):
+                    if time.perf_counter() > deadline:
+                        break
+                    a = k * TAU / 8
+                    q = (cover[0] + math.cos(a) * r, cover[1] + math.sin(a) * r)
+                    if not self.w.walkable(*q) or not self.safe_at(q, t + 10, 5):
+                        continue
+                    if self.w.los((q[0], q[1], self.w.ground(*q) + mh), tc):
+                        peek = q
+                        break
+                if peek is not None:
+                    break
+        self.sn = dict(tid=m["id"], tpos=tc, t=t, cover=cover, peek=peek)
+        return self.sn
+
+    def snipe_step(self, obs, target, hpf):
+        """Target in view at 60-250 m and we hold a laser: charge in cover, peek, release, back. -> (mode, move, boost)"""
+        if target is None or hpf < B_HIDE_HPF:
+            return None
+        ri, las = self.weapon("laser")
+        if las is None:
+            return None
+        m, vis, dist = target
+        if not (SN_MIN_D <= dist <= SN_MAX_D):
+            return None
+        plan = self.snipe_plan(m)
+        cover, peek = plan["cover"], plan["peek"]
+        if peek is None and vis:
+            peek = (self.pos[0], self.pos[1])             # we can already see it from here
+        if peek is None:
+            return None                                   # no way to get a shot from near here
+        if cover is None:
+            cover = peek                                  # nowhere to hide: hold the firing spot
+        full = las["stats"].get("charge", 0.75)
+        ch = las.get("charge", 0) or 0
+        charged = ch >= full - 0.06
+        enemy_charging = any(e["kind"] == "mech" and e.get("charging") and d2(e["pos"], self.pos) > 45
+                             for e in obs["mechs"])
+        self.target_id = m["id"]
+        if las["cooldown"] > 0.05 or (enemy_charging and not charged):
+            self.sn_phase = "cover"
+            goal = cover
+        elif not charged:
+            self.sn_phase = "charge"                      # charge behind cover (half speed is fine here)
+            goal = cover
+        else:
+            self.sn_phase = "peek"                        # full charge: step out, release when on target
+            goal = peek
+        gd = d2(goal, self.pos)
+        if gd > 4:
+            move = self.go_to(goal)
+        elif gd > 0.8:
+            # go_to() calls < 4 m "arrived"; a peek spot has to be hit exactly
+            move = self.steer((goal[0] - self.pos[0], goal[1] - self.pos[1]), min(1.0, gd / 3 + 0.3))
+        else:
+            move = [0.0, 0.0]
+            if self.sn_phase == "peek" and not vis:
+                plan["t"] = -99                           # at the peek spot but no line: replan next tick
+        return "snipe", move, False
+
+    def snipe_shoot(self, target, out):
+        """Aim dead center (laser is hitscan); laser per snipe phase; gun only inside 100 m."""
+        m, vis, dist = target
+        me = self.me
+        tc = self.mech_center(m)
+        exact = self.aim_to(tc)
+        actual = me["aim"]
+        fire = [False, False]
+        ri, las = self.weapon("laser")
+        gi, gun = self.weapon("gun")
+        los_now = self.w.los(self.muzzle(), tc)
+        err = abs(wrap(actual[0] - exact[0])) + abs(actual[1] - exact[1])
+        if las is not None:
+            full = las["stats"].get("charge", 0.75)
+            ch = las.get("charge", 0) or 0
+            if ch >= full - 0.06:
+                if self.sn_phase == "peek" and los_now and err < max(math.atan2(2.5 * 0.7, dist), 0.01):
+                    pass                                   # let go: beam fires
+                else:
+                    fire[ri] = True                        # hold the full charge (up to hold_s)
+            elif ch > 0:
+                fire[ri] = True
+            elif self.sn_phase in ("charge", "peek") and las["cooldown"] <= 0.05:
+                fire[ri] = True                            # start charging
+        if gun is not None and dist < SN_GUN_MAX_D and los_now:
+            tol = max(math.atan2(2.0, max(dist, 1)), 0.012)
+            if abs(wrap(actual[0] - exact[0])) < tol and abs(actual[1] - exact[1]) < tol * 1.5:
+                fire[gi] = True
+            if gun.get("ammo", 1) == 0 and gun.get("reload", 0) == 0:
+                out["reload"] = True
+        out["aim"] = exact
+        out["fire"] = fire
 
     # ------------------------------------------------------------------ v4: pure survival
     def survive_spot(self):
@@ -1093,8 +1244,8 @@ class Bot:
             if self.w.exposure(self.pos[0], self.pos[1]) > AMBUSH_EXPO and self.have_cover(t) \
                     and d2(self.cover, self.pos) < 25:
                 move = self.go_to(self.cover)
-        elif self.brawl and (self.weapon("lightning")[1] is not None or self.weapon("laser")[1] is None):
-            move, boost = self.brawl_close(m, dist)
+        elif self.brawl and (self.snipe or self.weapon("lightning")[1] is not None or self.weapon("laser")[1] is None):
+            move, boost = self.brawl_close(m, dist)      # snipe: inside 60 m it brawls too
         else:
             move = self.steer((ax * radial - ay * self.strafe_dir, ay * radial + ax * self.strafe_dir))
         # don't strafe out of the zone
@@ -1308,6 +1459,8 @@ class Bot:
         return "cube", self.go_to(best[2])
 
     def pref_range(self, m, hpf):
+        if self.snipe and self.weapon("lightning")[1] is None:
+            return B_GUN_PREF                      # inside 60 m snipe brawls with the gun
         if self.brawl:
             if self.weapon("lightning")[1] is not None:
                 return sum(B_LIGHTNING_BAND) / 2
@@ -1372,6 +1525,8 @@ class Bot:
     def early_rush(self):
         w = self.me["weapons"]
         w1 = w[1] if len(w) > 1 else None
+        if self.snipe:
+            return self.t < RUSH_T and self.weapon("laser")[1] is None
         if self.brawl2:
             # rush until the lightning + laser loadout is complete
             return self.t < RUSH_T and (self.weapon("lightning")[1] is None or self.weapon("laser")[1] is None)
@@ -1534,7 +1689,8 @@ class Bot:
                 if height > ROOF_MAX_H:
                     continue
                 k = pk["kind"]
-                cands.append((d - B_RUSH_BONUS.get(k, 0), len(cands), q, "loot", B_RUSH_MAX_D.get(k, 40), d, pk, height < 2))
+                bonus, maxd = (SN_RUSH_BONUS, SN_RUSH_MAX_D) if self.snipe else (B_RUSH_BONUS, B_RUSH_MAX_D)
+                cands.append((d - bonus.get(k, 0), len(cands), q, "loot", maxd.get(k, 40), d, pk, height < 2))
             elif rush:
                 if height > ROOF_MAX_H:
                     continue
