@@ -7,7 +7,7 @@ import time
 import mechfight as mf
 from world import World, Planner
 
-STRATEGY = "snipe"     # "snipe" (v7 experiment), "brawl2" (v6), "brawl" (v5), "fight" (v3), "survive" (v4)
+STRATEGY = "snipe_dmg"  # "snipe_dmg" (v8), "snipe" (v7), "brawl2" (v6), "brawl" (v5), "fight" (v3), "survive" (v4)
 
 TAU = 2 * math.pi
 WEAPON_RANK = {"lightning": 3.0, "laser": 2.5, "mortar": 1.0, "gun": 0.0}
@@ -98,6 +98,15 @@ SN_GUN_MAX_D = 100.0         # in snipe mode, the gun only fires inside this
 SN_SWAP_FIGHT_D = 60.0
 SN_REPLAN_S = 4.0            # recompute cover/peek spots this often
 SN_PEEK_R = (3.0, 5.0, 8.0, 11.0)
+# v8: snipe_dmg = snipe with damage-first upgrades
+SD_WEAPON_UPS = {          # damage / fire-rate upgrades per held weapon
+    "laser": ["laser_damage", "laser_charge"],
+    "gun": ["gun_damage", "gun_rate"],
+    "lightning": ["lightning_efficiency"],      # -35% energy, +10% damage
+    "mortar": ["mortar_reload"],
+}
+SD_HELD_ORDER = ("laser", "gun", "lightning", "mortar")
+SD_DEFENSE_UPS = ["armor", "plating", "nanites"]
 B2_UPS = {
     "lightning": ["lightning_efficiency", "lightning_chain"],
     "laser": ["laser_damage", "laser_charge"],
@@ -179,9 +188,15 @@ class Bot:
         self.s_hide_spot = None
         self.s_look = None         # (spot, yaw) most exposed direction from the current spot
         # v5 brawl state
-        self.brawl = STRATEGY in ("brawl", "brawl2", "snipe")
+        self.brawl = STRATEGY in ("brawl", "brawl2", "snipe", "snipe_dmg")
         self.brawl2 = STRATEGY == "brawl2"
-        self.snipe = STRATEGY == "snipe"
+        self.snipe = STRATEGY in ("snipe", "snipe_dmg")
+        self.snipe_dmg = STRATEGY == "snipe_dmg"
+        if self.snipe_dmg:
+            for u in self.cfg.get("upgrades", []):
+                eff = ", ".join(f"{e.get('path')} {'x' + str(e['mul']) if 'mul' in e else ''}{'+' + str(e['add']) if 'add' in e else ''}"
+                                for e in u.get("effects", []))
+                mf.log(f"upgrade {u['id']}" + (f" [{u['requires']}]" if u.get("requires") else "") + f" max {u.get('max')}: {eff}")
         self.sn = None             # peek plan: dict(tid, tpos, t, cover, peek)
         self.sn_phase = ""
         self.cur_target_d = None
@@ -1503,6 +1518,13 @@ class Bot:
     def upgrade_rank(self):
         """id -> rank (lower is better): survival, held-weapon upgrades, general, the rest."""
         held = sorted({w["kind"] for w in self.me["weapons"] if w}, key=lambda k: -WEAPON_RANK.get(k, 0))
+        if self.snipe_dmg:
+            # 1. damage/rate for held weapons, 2. armor, 3. max hp, regen, 4. everything else
+            order = [u for k in SD_HELD_ORDER if k in held for u in SD_WEAPON_UPS[k]] + SD_DEFENSE_UPS
+            rank = {}
+            for u in order + GENERAL_UPS + self.up_ids:
+                rank.setdefault(u, len(rank))
+            return rank
         if self.brawl2:
             # damage first: held weapons' damage/rate, then armor, max hp, then the rest
             order = [u for k in held for u in B2_UPS.get(k, [])] + ["armor", "plating"]
